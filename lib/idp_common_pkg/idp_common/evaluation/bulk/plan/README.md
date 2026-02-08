@@ -23,6 +23,7 @@ Review these decisions before building. Each links to a detailed analysis with p
 | [Eval Service Changes](./eval-service-changes.md) | Changes to `evaluate_section()` and `_transform_stickler_result()` with before/after code |
 | [Schema & API](./schema-and-api.md) | GraphQL schema changes, `fieldLevelMetrics` JSON shape, resolver changes, query updates |
 | [UI Changes](./ui-changes.md) | Test Studio wireframes, field-level metrics table, color coding, component structure |
+| [Testing & Verification](./testing.md) | 3-layer test plan: unit tests, notebook verification, integration test — with code samples and reviewer checklist |
 
 ---
 
@@ -369,7 +370,7 @@ const GET_TEST_RUN = `
 
 ---
 
-### Phase 6: Notebook and documentation
+### Phase 6: Notebook, testing, and documentation
 
 #### 6a. Create bulk evaluation notebook
 
@@ -381,7 +382,15 @@ Demonstrate:
 3. Inspecting field-level metrics
 4. Identifying worst-performing fields
 
-#### 6b. Update evaluation README and create bulk README
+This notebook also serves as the Layer 2 verification artifact — see [testing.md](./testing.md) for the full test plan including synthetic fixtures, hand-verifiable assertions, and the reviewer checklist.
+
+#### 6b. Unit tests
+
+File: `lib/idp_common_pkg/tests/unit/evaluation/test_bulk_aggregator.py`
+
+See [testing.md](./testing.md) for test cases and sample code.
+
+#### 6c. Update evaluation README and create bulk README
 
 File: `lib/idp_common_pkg/idp_common/evaluation/README.md`
 
