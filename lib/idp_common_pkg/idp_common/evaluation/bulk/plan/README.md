@@ -1,0 +1,495 @@
+# Bulk Evaluator Aggregation Integration Plan — IDP Accelerator × Stickler
+
+## Executive Summary
+
+Integrate Stickler's `BulkStructuredModelEvaluator` aggregation logic into the IDP Accelerator's Test Studio metrics view. Currently, the Test Studio aggregates metrics via SQL (Athena AVG queries over per-document rows). This plan replaces that with Python-based aggregation using Stickler's confusion-matrix accumulation, yielding field-level TP/FP/FN/TN counts, derived P/R/F1/Accuracy, and weighted scoring across the full document set — surfaced in the Test Studio UI.
+
+### What will be done
+
+- Add a `BulkEvaluationAggregator` class in a new `idp_common.evaluation.bulk` subpackage that replicates Stickler's `BulkStructuredModelEvaluator` accumulation logic (without importing stickler directly, to avoid Lambda dependency issues)
+- Modify the `test_results_resolver` Lambda to call the new aggregator instead of (or in addition to) the current Athena AVG queries
+- Extend the GraphQL `TestRun` type with a `fieldLevelMetrics` field
+- Update the Test Studio `TestResults.jsx` UI to display field-level metrics (P/R/F1 per field, sorted by worst-performing)
+- Store per-document confusion matrix data in the reporting pipeline so it can be re-aggregated
+- Create/update a notebook demonstrating bulk evaluation
+
+### What will NOT be done
+
+- Replace the existing per-document Stickler evaluation (`EvaluationService.evaluate_section`) — that stays as-is
+- Remove the existing Athena-based cost aggregation — cost metrics remain SQL-based
+- Add the full `BulkStructuredModelEvaluator` class with checkpointing/distributed merge to the accelerator — only the accumulation and compute logic
+- Modify the document processing pipeline (Step Functions, Lambda orchestration)
+
+### Files to be modified
+
+```
+accelerated-intelligent-document-processing-on-aws/
+├── lib/idp_common_pkg/
+│   └── idp_common/
+│       └── evaluation/
+│           ├── __init__.py                          # Export new aggregator
+│           ├── bulk/                                # NEW — dedicated subpackage
+│           │   ├── __init__.py                      # Package init + exports
+│           │   ├── README.md                        # Feature docs (create first)
+│           │   └── aggregator.py                    # BulkEvaluationAggregator class
+│           └── service.py                           # Add confusion_matrix to eval output
+├── nested/appsync/
+│   └── src/
+│       ├── api/schema.graphql                       # Add fieldLevelMetrics to TestRun
+│       └── lambda/test_results_resolver/index.py    # Call bulk aggregator
+├── src/
+│   ├── lambda/save_reporting_data/ (or reporting)   # Store confusion_matrix in parquet
+│   └── ui/src/components/test-studio/
+│       └── TestResults.jsx                          # Field-level metrics UI
+├── notebooks/examples/
+│   └── step7_bulk_evaluation.ipynb                  # NEW — demo notebook
+└── lib/idp_common_pkg/tests/unit/evaluation/
+    └── test_bulk_aggregator.py                      # NEW — unit tests
+```
+
+---
+
+## Implementation Phases
+
+### Phase 1: Ensure per-document confusion matrix data is available
+
+The `BulkStructuredModelEvaluator.update()` calls `gt_model.compare_with(pred_model, include_confusion_matrix=True)` and accumulates the `confusion_matrix` key from the result. The IDP accelerator's `EvaluationService._transform_stickler_result()` already calls `compare_with()` but may not persist the confusion matrix. We need to ensure it does.
+
+#### 1a. Verify `compare_with` output includes confusion_matrix
+
+Check that `EvaluationService.evaluate_section()` passes `include_confusion_matrix=True` and that the raw confusion matrix is preserved in the evaluation results JSON stored to S3.
+
+File: `lib/idp_common_pkg/idp_common/evaluation/service.py`
+
+In `evaluate_section()` (around line 1336), ensure the `compare_with` call includes:
+```python
+result = gt_model.compare_with(
+    pred_model,
+    include_confusion_matrix=True,
+    document_non_matches=True,
+)
+```
+
+#### 1b. Persist confusion_matrix in evaluation results JSON
+
+In `_transform_stickler_result()`, ensure the `confusion_matrix` key from the Stickler result is included in the output dict that gets saved to S3:
+
+```python
+# In the result dict being built:
+"confusion_matrix": stickler_result.get("confusion_matrix", {}),
+```
+
+#### 1c. Add confusion_matrix to reporting parquet schema
+
+File: `lib/idp_common_pkg/idp_common/reporting/save_reporting_data.py`
+
+Add a `confusion_matrix_json` string column to the `document_evaluations` parquet schema that stores the serialized confusion matrix per document. This enables re-aggregation from Athena if needed.
+
+```python
+("confusion_matrix_json", pa.string()),  # JSON-serialized confusion matrix
+```
+
+---
+
+### Phase 2: Create `BulkEvaluationAggregator` in `evaluation/bulk/` subpackage
+
+This is the core aggregation class. It replicates the accumulation logic from `BulkStructuredModelEvaluator` but operates on pre-computed confusion matrix dicts (not StructuredModel instances), since the per-document evaluation has already happened.
+
+The new subpackage lives at `idp_common/evaluation/bulk/`, following the project's pattern of organizing sub-features into subfolders (like `agents/analytics/`, `agents/testing/`). This gives the feature a dedicated home for its README, aggregator, models, and any future additions.
+
+File: `lib/idp_common_pkg/idp_common/evaluation/bulk/__init__.py`
+
+```python
+"""Bulk evaluation aggregation for multi-document metrics."""
+
+from idp_common.evaluation.bulk.aggregator import BulkEvaluationAggregator
+
+__all__ = ["BulkEvaluationAggregator"]
+```
+
+File: `lib/idp_common_pkg/idp_common/evaluation/bulk/aggregator.py`
+
+```python
+"""
+Bulk evaluation aggregator for multi-document metrics.
+
+Accumulates per-document confusion matrix results into aggregate
+field-level and overall metrics. Replicates the accumulation logic
+from stickler's BulkStructuredModelEvaluator without requiring
+stickler as a runtime dependency.
+"""
+
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+
+
+class BulkEvaluationAggregator:
+    """
+    Accumulates confusion matrix results across documents to produce
+    aggregate field-level and overall P/R/F1/Accuracy metrics.
+    """
+
+    METRIC_KEYS = ("tp", "fp", "tn", "fn", "fd", "fa")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._overall = defaultdict(int)
+        self._fields = defaultdict(lambda: defaultdict(int))
+        self._doc_count = 0
+        self._errors = []
+
+    def update(self, confusion_matrix: Dict[str, Any], doc_id: Optional[str] = None):
+        """Accumulate one document's confusion matrix."""
+        if not confusion_matrix:
+            return
+        self._doc_count += 1
+
+        # Overall
+        if "overall" in confusion_matrix:
+            for k, v in confusion_matrix["overall"].items():
+                if k in self.METRIC_KEYS and isinstance(v, (int, float)):
+                    self._overall[k] += v
+
+        # Fields (recursive)
+        if "fields" in confusion_matrix:
+            self._accumulate_fields(confusion_matrix["fields"], "")
+
+    def _accumulate_fields(self, fields: Dict, prefix: str):
+        """Recursively accumulate field metrics with dotted paths."""
+        for name, data in fields.items():
+            path = f"{prefix}.{name}" if prefix else name
+            if not isinstance(data, dict):
+                continue
+
+            # Direct metrics
+            for k in self.METRIC_KEYS:
+                if k in data and isinstance(data[k], (int, float)):
+                    self._fields[path][k] += data[k]
+
+            # Hierarchical: overall + fields
+            if "overall" in data:
+                for k, v in data["overall"].items():
+                    if k in self.METRIC_KEYS and isinstance(v, (int, float)):
+                        self._fields[path][k] += v
+            if "fields" in data and isinstance(data["fields"], dict):
+                self._accumulate_fields(data["fields"], path)
+
+            # List fields with nested_fields
+            if "nested_fields" in data:
+                for nf_name, nf_data in data["nested_fields"].items():
+                    nf_path = f"{path}.{nf_name}"
+                    for k, v in nf_data.items():
+                        if k in self.METRIC_KEYS and isinstance(v, (int, float)):
+                            self._fields[nf_path][k] += v
+
+    def compute(self) -> Dict[str, Any]:
+        """Return aggregated metrics."""
+        return {
+            "document_count": self._doc_count,
+            "overall": self._derive(dict(self._overall)),
+            "fields": {
+                path: self._derive(dict(counts))
+                for path, counts in sorted(self._fields.items())
+            },
+            "errors": self._errors,
+        }
+
+    @staticmethod
+    def _derive(cm: Dict[str, int]) -> Dict[str, Any]:
+        tp, fp, fn, tn = cm.get("tp", 0), cm.get("fp", 0), cm.get("fn", 0), cm.get("tn", 0)
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+        return {**cm, "precision": p, "recall": r, "f1": f1, "accuracy": acc}
+```
+
+#### 2b. Export from `evaluation/__init__.py`
+
+File: `lib/idp_common_pkg/idp_common/evaluation/__init__.py`
+
+```python
+# Bulk aggregation
+from idp_common.evaluation.bulk import BulkEvaluationAggregator
+```
+
+---
+
+### Phase 3: Integrate aggregator into test_results_resolver Lambda
+
+File: `nested/appsync/src/lambda/test_results_resolver/index.py`
+
+The current `_aggregate_test_run_metrics()` function queries Athena for AVG metrics. We need to add a parallel path that:
+
+1. Queries the per-document `confusion_matrix_json` from Athena
+2. Feeds each into `BulkEvaluationAggregator.update()`
+3. Calls `compute()` to get field-level metrics
+4. Returns these alongside the existing metrics
+
+#### 3a. Add field-level metrics query
+
+```python
+def _get_field_level_metrics_from_athena(test_run_id):
+    """Get per-document confusion matrices and aggregate via BulkEvaluationAggregator."""
+    database = os.environ.get('ATHENA_DATABASE')
+    if not database:
+        return {}
+
+    query = f"""
+    SELECT document_id, confusion_matrix_json
+    FROM "{database}"."document_evaluations"
+    WHERE document_id LIKE '{test_run_id}%'
+      AND confusion_matrix_json IS NOT NULL
+    """
+    results = _execute_athena_query(query, database)
+
+    if not results:
+        return {}
+
+    from idp_common.evaluation.bulk import BulkEvaluationAggregator
+    import json
+
+    aggregator = BulkEvaluationAggregator()
+    for row in results:
+        try:
+            cm = json.loads(row['confusion_matrix_json'])
+            aggregator.update(cm, doc_id=row.get('document_id'))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return aggregator.compute()
+```
+
+#### 3b. Wire into `_aggregate_test_run_metrics`
+
+Add `field_level_metrics` to the returned dict:
+
+```python
+def _aggregate_test_run_metrics(test_run_id):
+    evaluation_metrics = _get_evaluation_metrics_from_athena(test_run_id)
+    cost_data = _get_cost_data_from_athena(test_run_id)
+    field_level_metrics = _get_field_level_metrics_from_athena(test_run_id)
+
+    return {
+        # ... existing keys ...
+        'field_level_metrics': field_level_metrics,
+    }
+```
+
+#### 3c. Include in cached and returned results
+
+Update `get_test_results()` and `handle_cache_update_request()` to include `fieldLevelMetrics` in the response and cache.
+
+---
+
+### Phase 4: Extend GraphQL schema
+
+File: `nested/appsync/src/api/schema.graphql`
+
+Add `fieldLevelMetrics` to the `TestRun` type:
+
+```graphql
+type TestRun @aws_cognito_user_pools @aws_iam {
+  # ... existing fields ...
+  fieldLevelMetrics: AWSJSON
+}
+```
+
+This is a JSON blob containing the output of `BulkEvaluationAggregator.compute()` — overall and per-field P/R/F1/Accuracy with raw TP/FP/FN/TN counts.
+
+---
+
+### Phase 5: Update Test Studio UI
+
+File: `src/ui/src/components/test-studio/TestResults.jsx`
+
+#### 5a. Add field-level metrics table
+
+Add a new `ExpandableSection` (or a primary section) titled "Field-Level Metrics" that renders a sortable table with columns:
+
+| Field | Precision | Recall | F1 | Accuracy | TP | FP | FN |
+|-------|-----------|--------|----|----------|----|----|----|
+
+Sorted by F1 ascending (worst-performing fields first) so users can immediately see which fields need prompt tuning.
+
+#### 5b. Parse the new `fieldLevelMetrics` from GraphQL response
+
+In the existing `getTestRun` query result handling, parse `fieldLevelMetrics` (it comes as AWSJSON string, needs `JSON.parse()`).
+
+#### 5c. Visual indicators
+
+- Color-code F1 scores: red (<0.5), yellow (0.5-0.8), green (>0.8)
+- Show overall aggregate metrics (total TP/FP/FN across all fields) in the existing summary section
+- Add a bar chart showing F1 per field (using existing recharts dependency)
+
+#### 5d. Update GraphQL query
+
+File: `src/ui/src/graphql/queries/getTestResults.js`
+
+Add `fieldLevelMetrics` to the query:
+
+```javascript
+const GET_TEST_RUN = `
+  query GetTestRun($testRunId: String!) {
+    getTestRun(testRunId: $testRunId) {
+      # ... existing fields ...
+      fieldLevelMetrics
+    }
+  }
+`;
+```
+
+---
+
+### Phase 6: Notebook and documentation
+
+#### 6a. Create bulk evaluation notebook
+
+File: `notebooks/examples/step7_bulk_evaluation.ipynb`
+
+Demonstrate:
+1. Loading multiple document evaluation results
+2. Using `BulkEvaluationAggregator` to accumulate
+3. Inspecting field-level metrics
+4. Identifying worst-performing fields
+
+#### 6b. Update evaluation README and create bulk README
+
+File: `lib/idp_common_pkg/idp_common/evaluation/README.md`
+
+Add section pointing to the new `bulk/` subpackage for multi-document aggregation.
+
+File: `lib/idp_common_pkg/idp_common/evaluation/bulk/README.md`
+
+Primary documentation for the feature: what it does, how it maps to Stickler's `BulkStructuredModelEvaluator`, usage examples, and the data flow from per-document confusion matrices to aggregated field-level metrics. This file should be created first, before any code, to document intent and design decisions.
+
+---
+
+## KISS Review
+
+### KISS Recommendation 1: Aggregate in Lambda from S3 eval results (skip Athena column)
+
+#### Simplified Approach
+
+Instead of adding a `confusion_matrix_json` column to the Athena parquet schema and querying it back, have the `test_results_resolver` Lambda directly read the per-document evaluation JSON files from S3 (they already contain the confusion matrix if Phase 1 is done), aggregate in-memory, and return.
+
+#### Pros
+
+- No schema migration for existing Athena tables
+- No need to backfill existing data
+- Simpler data pipeline — fewer moving parts
+- Works immediately for all existing test runs (if eval JSONs already have confusion_matrix)
+
+#### Cons
+
+- Slower for large test sets (must read N S3 objects)
+- Lambda timeout risk for very large test sets (>500 docs)
+- No SQL-level access to confusion matrices for ad-hoc analysis
+
+#### Comparison
+
+| Aspect | Current Plan (Athena column) | KISS Alternative (S3 direct) |
+|--------|------------------------------|------------------------------|
+| Complexity | Medium — schema change + backfill | Low — read existing S3 files |
+| Maintenance | Two data paths to maintain | Single path |
+| Extensibility | Better for future SQL analytics | Limited to Lambda aggregation |
+| Implementation Time | ~3 days | ~1.5 days |
+| Backward Compat | Requires data migration | Works with existing data |
+
+#### Steps to Simplify
+
+1. In Phase 1, ensure `confusion_matrix` is in the eval results JSON saved to S3 (this is needed either way)
+2. Skip Phase 1c entirely (no parquet schema change)
+3. In Phase 3, instead of querying Athena for `confusion_matrix_json`, query Athena for just the `document_id` list, then read each document's eval JSON from S3 using the existing `evaluation_results_uri` pattern
+4. Use `BulkEvaluationAggregator` on the S3-loaded confusion matrices
+5. Cache the result in DynamoDB (already planned) so this only runs once per test run
+
+**Recommendation: Use the KISS approach for initial implementation.** The Athena column can be added later if SQL-level access to confusion matrices becomes a requirement.
+
+---
+
+## Code Samples
+
+### BulkEvaluationAggregator usage pattern (Lambda context)
+
+```python
+from idp_common.evaluation.bulk import BulkEvaluationAggregator
+import json
+
+aggregator = BulkEvaluationAggregator()
+
+# For each document in the test run
+for doc_eval_result in document_eval_results:
+    cm = doc_eval_result.get("confusion_matrix", {})
+    aggregator.update(cm, doc_id=doc_eval_result.get("document_id"))
+
+# Get aggregated metrics
+result = aggregator.compute()
+# result = {
+#   "document_count": 75,
+#   "overall": {"tp": 450, "fp": 12, "fn": 8, "precision": 0.974, "recall": 0.982, "f1": 0.978, "accuracy": 0.957},
+#   "fields": {
+#     "invoice_id": {"tp": 75, "fp": 0, "fn": 0, "precision": 1.0, "recall": 1.0, "f1": 1.0, "accuracy": 1.0},
+#     "customer_name": {"tp": 68, "fp": 3, "fn": 4, "precision": 0.957, "recall": 0.944, "f1": 0.951, "accuracy": 0.907},
+#     "line_items.description": {"tp": 180, "fp": 5, "fn": 2, ...},
+#   }
+# }
+```
+
+### TestResults.jsx field-level metrics table (React)
+
+```jsx
+const FieldLevelMetrics = ({ fieldLevelMetrics }) => {
+  if (!fieldLevelMetrics?.fields) return null;
+
+  const items = Object.entries(fieldLevelMetrics.fields)
+    .map(([field, metrics]) => ({ field, ...metrics }))
+    .filter(item => (item.tp + item.fp + item.fn) > 0)
+    .sort((a, b) => a.f1 - b.f1); // Worst first
+
+  return (
+    <Table
+      header={<Header variant="h3">Field-Level Metrics (Aggregated)</Header>}
+      items={items}
+      columnDefinitions={[
+        { id: 'field', header: 'Field', cell: item => item.field },
+        { id: 'f1', header: 'F1', cell: item => item.f1.toFixed(3) },
+        { id: 'precision', header: 'Precision', cell: item => item.precision.toFixed(3) },
+        { id: 'recall', header: 'Recall', cell: item => item.recall.toFixed(3) },
+        { id: 'tp', header: 'TP', cell: item => item.tp },
+        { id: 'fp', header: 'FP', cell: item => item.fp },
+        { id: 'fn', header: 'FN', cell: item => item.fn },
+      ]}
+      sortingColumn={{ id: 'f1' }}
+      sortingDescending={false}
+    />
+  );
+};
+```
+
+### Notebook cell — loading and aggregating
+
+```python
+import json
+from idp_common.evaluation.bulk import BulkEvaluationAggregator
+
+# Load eval results (from S3 or local)
+eval_files = ["doc1_eval.json", "doc2_eval.json", ...]
+
+aggregator = BulkEvaluationAggregator()
+for f in eval_files:
+    with open(f) as fh:
+        result = json.load(fh)
+    aggregator.update(result.get("confusion_matrix", {}), doc_id=f)
+
+metrics = aggregator.compute()
+
+# Display field-level metrics sorted by F1
+import pandas as pd
+df = pd.DataFrame([
+    {"field": k, **v} for k, v in metrics["fields"].items()
+]).sort_values("f1")
+df[["field", "precision", "recall", "f1", "tp", "fp", "fn"]]
+```
