@@ -1,5 +1,31 @@
 # Bulk Evaluator Aggregation Integration Plan — IDP Accelerator × Stickler
 
+📌 **Original Issue**: [#179 — Bulk Evaluation Aggregation](https://github.com/aws-solutions-library-samples/accelerated-intelligent-document-processing-on-aws/issues/179)
+
+## ⚠️ KISS Decisions Required Before Implementation
+
+Review these decisions before building. Each links to a detailed analysis with pros/cons:
+
+| # | Decision | Options | Recommended | Doc |
+|---|----------|---------|-------------|-----|
+| 1 | **Import Stickler directly or reimplement accumulation?** | Import `BulkStructuredModelEvaluator` vs custom `BulkEvaluationAggregator` | Custom aggregator — Stickler's API takes StructuredModel instances (mismatch), adds 221 MB deps, requires Lambda packaging change | [kiss/stickler-import.md](./kiss/stickler-import.md) |
+| 2 | **Retrieve confusion matrices from Athena or S3?** | Add Athena parquet column vs read eval JSONs from S3 | S3 direct — no schema migration, no backfill, cached in DynamoDB after first run | [kiss/s3-vs-athena.md](./kiss/s3-vs-athena.md) |
+| 3 | **Store confusion matrix in model or metrics dict?** | New field on `SectionEvaluationResult` vs embed in existing `metrics` dict | Metrics dict — one line change, no model changes, follows existing pattern | [kiss/confusion-matrix-storage.md](./kiss/confusion-matrix-storage.md) |
+
+---
+
+## Detailed Plan Documents
+
+| Document | Description |
+|----------|-------------|
+| [Data Flow](./data-flow.md) | End-to-end data flow with Mermaid diagrams, current vs proposed state, confusion matrix structure |
+| [Aggregator Design](./aggregator-design.md) | `BulkEvaluationAggregator` class API, input/output shapes, field path resolution, design decisions |
+| [Eval Service Changes](./eval-service-changes.md) | Changes to `evaluate_section()` and `_transform_stickler_result()` with before/after code |
+| [Schema & API](./schema-and-api.md) | GraphQL schema changes, `fieldLevelMetrics` JSON shape, resolver changes, query updates |
+| [UI Changes](./ui-changes.md) | Test Studio wireframes, field-level metrics table, color coding, component structure |
+
+---
+
 ## Executive Summary
 
 Integrate Stickler's `BulkStructuredModelEvaluator` aggregation logic into the IDP Accelerator's Test Studio metrics view. Currently, the Test Studio aggregates metrics via SQL (Athena AVG queries over per-document rows). This plan replaces that with Python-based aggregation using Stickler's confusion-matrix accumulation, yielding field-level TP/FP/FN/TN counts, derived P/R/F1/Accuracy, and weighted scoring across the full document set — surfaced in the Test Studio UI.
@@ -369,44 +395,11 @@ Primary documentation for the feature: what it does, how it maps to Stickler's `
 
 ## KISS Review
 
-### KISS Recommendation 1: Aggregate in Lambda from S3 eval results (skip Athena column)
+See the [kiss/](./kiss/) directory for detailed analysis of each simplification decision:
 
-#### Simplified Approach
-
-Instead of adding a `confusion_matrix_json` column to the Athena parquet schema and querying it back, have the `test_results_resolver` Lambda directly read the per-document evaluation JSON files from S3 (they already contain the confusion matrix if Phase 1 is done), aggregate in-memory, and return.
-
-#### Pros
-
-- No schema migration for existing Athena tables
-- No need to backfill existing data
-- Simpler data pipeline — fewer moving parts
-- Works immediately for all existing test runs (if eval JSONs already have confusion_matrix)
-
-#### Cons
-
-- Slower for large test sets (must read N S3 objects)
-- Lambda timeout risk for very large test sets (>500 docs)
-- No SQL-level access to confusion matrices for ad-hoc analysis
-
-#### Comparison
-
-| Aspect | Current Plan (Athena column) | KISS Alternative (S3 direct) |
-|--------|------------------------------|------------------------------|
-| Complexity | Medium — schema change + backfill | Low — read existing S3 files |
-| Maintenance | Two data paths to maintain | Single path |
-| Extensibility | Better for future SQL analytics | Limited to Lambda aggregation |
-| Implementation Time | ~3 days | ~1.5 days |
-| Backward Compat | Requires data migration | Works with existing data |
-
-#### Steps to Simplify
-
-1. In Phase 1, ensure `confusion_matrix` is in the eval results JSON saved to S3 (this is needed either way)
-2. Skip Phase 1c entirely (no parquet schema change)
-3. In Phase 3, instead of querying Athena for `confusion_matrix_json`, query Athena for just the `document_id` list, then read each document's eval JSON from S3 using the existing `evaluation_results_uri` pattern
-4. Use `BulkEvaluationAggregator` on the S3-loaded confusion matrices
-5. Cache the result in DynamoDB (already planned) so this only runs once per test run
-
-**Recommendation: Use the KISS approach for initial implementation.** The Athena column can be added later if SQL-level access to confusion matrices becomes a requirement.
+- [kiss/stickler-import.md](./kiss/stickler-import.md) — Import Stickler directly vs custom aggregator
+- [kiss/s3-vs-athena.md](./kiss/s3-vs-athena.md) — S3 direct reads vs Athena column for confusion matrix retrieval
+- [kiss/confusion-matrix-storage.md](./kiss/confusion-matrix-storage.md) — Model field vs metrics dict for confusion matrix persistence
 
 ---
 
