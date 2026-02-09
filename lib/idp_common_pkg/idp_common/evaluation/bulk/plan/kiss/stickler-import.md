@@ -301,3 +301,17 @@ The Stickler import approach would be better if:
 - Stickler offered a `update_from_confusion_matrix(cm_dict)` public method (it doesn't today)
 
 If Stickler adds a public API for accumulating pre-computed confusion matrices in a future version, we should revisit this decision.
+
+---
+
+## Future: Post-Refactor Migration Path
+
+When Stickler ships `aggregate_from_comparisons(comparisons: list[dict])`, the migration is:
+
+1. **`idp_common` aggregator** — replace custom `BulkEvaluationAggregator` with a thin wrapper around Stickler's method. The `EvaluationFunction` Lambda (Docker image) already has Stickler installed.
+
+2. **`test_results_resolver` Lambda** — keep the standalone `bulk_aggregator.py` copy. This Lambda is a bare Zip with no layers. Adding Stickler (221 MB) is not viable unless the dependency chain shrinks significantly.
+
+3. **Long-term** — if Stickler extracts the accumulation logic into a zero-dep subpackage (e.g., `stickler-eval[core]` without scipy/pandas), the Lambda copy can be replaced with a direct import.
+
+See [future-stickler-refactor.md](../future-stickler-refactor.md) for full details.

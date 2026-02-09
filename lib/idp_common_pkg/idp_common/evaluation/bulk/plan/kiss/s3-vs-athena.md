@@ -28,3 +28,16 @@ The DynamoDB cache means aggregation only runs once per test run, so the S3 read
 3. Phase 3: Query Athena for `document_id` list, read each eval JSON from S3
 4. Feed confusion matrices into `BulkEvaluationAggregator`
 5. Cache result in DynamoDB — subsequent requests served from cache
+
+## Future: Option C — Confusion Matrix Parquet Files
+
+A third option emerged from reviewer feedback: write confusion matrices to dedicated parquet files in the reporting bucket, then read a single consolidated file instead of N eval JSONs.
+
+| Aspect | S3 Direct (current) | Parquet Files (future) |
+|--------|---------------------|----------------------|
+| Read pattern | N `GetObject` calls | 1 prefix scan + concat |
+| Requires reporting pipeline change | No | Yes |
+| Requires `pyarrow` in Lambda | No | Yes |
+| Notebook experience | Load individual JSONs | `pd.read_parquet()` on prefix |
+
+This is deferred because DynamoDB caching eliminates the repeated-read concern for the Lambda path. The parquet approach is most valuable for notebooks analyzing large test runs. See [kiss/aggregation-data-source.md](./aggregation-data-source.md) and [future-stickler-refactor.md](../future-stickler-refactor.md).

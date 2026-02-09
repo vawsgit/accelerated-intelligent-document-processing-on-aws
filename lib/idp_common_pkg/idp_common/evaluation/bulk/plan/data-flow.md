@@ -15,7 +15,7 @@ flowchart TD
         H[test_results_resolver Lambda]
         I[Query Athena for doc IDs]
         J[Read eval JSONs from S3]
-        K[BulkEvaluationAggregator.update per doc]
+        K["bulk_aggregator.py<br/>(standalone copy, no deps)"]
         L[BulkEvaluationAggregator.compute]
         M[Cache in DynamoDB]
         N[Return via GraphQL]
@@ -24,6 +24,29 @@ flowchart TD
     H --> I --> J --> K --> L --> M --> N
     F -.-> J
 ```
+
+## Architecture North Star
+
+```
+Stickler (library)                    IDP Accelerator (application)
+┌─────────────────────────┐           ┌──────────────────────────────┐
+│ Core (no network deps)  │           │ Per-doc evaluation (Lambda)  │
+│ • StructuredModel       │           │ • compare_with() → JSON → S3 │
+│ • compare_with()        │           │                              │
+│ • BulkEvaluator         │           │ Post-processing (Lambda)     │
+│   • aggregate_from_     │◄──future──│ • Read eval JSONs from S3    │
+│     comparisons()       │           │ • bulk_aggregator.py (copy)  │
+│   • compute()           │           │ • Cache in DynamoDB          │
+│                         │           │ • Serve via GraphQL          │
+│ Optional [storage]      │           │                              │
+│ • save/load parquet     │           │ Notebooks                    │
+│ • file:// and s3://     │           │ • idp_common aggregator      │
+│ • S3 + MinIO compatible │           │ • Analyze field-level metrics│
+└─────────────────────────┘           └──────────────────────────────┘
+```
+
+**Now:** Custom aggregator in both places (Lambda copy + idp_common).
+**After Stickler refactor:** idp_common swaps to Stickler native; Lambda copy stays (no Stickler deps in Lambda).
 
 ## Current State: What Exists Today
 

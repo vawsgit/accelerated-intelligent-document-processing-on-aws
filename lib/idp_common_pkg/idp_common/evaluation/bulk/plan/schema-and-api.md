@@ -172,11 +172,16 @@ def _get_field_level_metrics(test_run_id):
     """
     Load per-document eval JSONs from S3, extract confusion matrices,
     and aggregate via BulkEvaluationAggregator.
+
+    Uses bulk_aggregator.py — a standalone ~80-line file alongside index.py
+    with zero deps beyond stdlib. No Lambda layers needed.
     """
-    # 1. Query Athena for document IDs + eval result S3 URIs
+    from bulk_aggregator import BulkEvaluationAggregator
+    # 1. Query Athena for document IDs + eval result S3 keys
     # 2. Read each eval JSON from S3
-    # 3. Feed confusion_matrix into aggregator
-    # 4. Return aggregator.compute()
+    # 3. Extract confusion_matrix from section metrics
+    # 4. Feed into aggregator.update()
+    # 5. Return aggregator.compute()
 ```
 
 ### Cache update in `handle_cache_update_request`

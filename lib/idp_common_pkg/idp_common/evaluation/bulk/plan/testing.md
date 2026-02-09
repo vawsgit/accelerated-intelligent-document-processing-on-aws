@@ -112,6 +112,17 @@ cd lib/idp_common_pkg
 pytest tests/unit/evaluation/test_bulk_aggregator.py -v
 ```
 
+### Sync Check
+
+The aggregator exists in two places. Verify they're identical:
+
+```bash
+diff lib/idp_common_pkg/idp_common/evaluation/bulk/aggregator.py \
+     nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py
+```
+
+This should produce no output. Add this check to the reviewer checklist.
+
 ---
 
 ## Layer 2: Notebook Verification (Manual)
@@ -394,6 +405,7 @@ No new test data files need to be created. The synthetic fixtures in the unit te
 
 ```
 □ Unit tests pass: pytest tests/unit/evaluation/test_bulk_aggregator.py -v
+□ Aggregator files are identical: diff aggregator.py bulk_aggregator.py (no output)
 □ Notebook Cell 5 assertions pass (synthetic data)
 □ Notebook Cell 6 loads real S3 data (if stack available)
 □ Eval results JSON contains confusion_matrix in metrics

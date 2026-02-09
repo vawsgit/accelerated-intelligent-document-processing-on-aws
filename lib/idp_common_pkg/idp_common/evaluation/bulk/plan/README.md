@@ -8,9 +8,10 @@ Review these decisions before building. Each links to a detailed analysis with p
 
 | # | Decision | Options | Recommended | Doc |
 |---|----------|---------|-------------|-----|
-| 1 | **Import Stickler directly or reimplement accumulation?** | Import `BulkStructuredModelEvaluator` vs custom `BulkEvaluationAggregator` | Custom aggregator — Stickler's API takes StructuredModel instances (mismatch), adds 221 MB deps, requires Lambda packaging change | [kiss/stickler-import.md](./kiss/stickler-import.md) |
+| 1 | **Import Stickler directly or reimplement accumulation?** | Import `BulkStructuredModelEvaluator` vs custom `BulkEvaluationAggregator` | Custom aggregator (~80 lines) — Stickler's API takes StructuredModel instances (mismatch), adds 221 MB deps. Swap to Stickler native after refactor ships. | [kiss/stickler-import.md](./kiss/stickler-import.md) |
 | 2 | **Retrieve confusion matrices from Athena or S3?** | Add Athena parquet column vs read eval JSONs from S3 | S3 direct — no schema migration, no backfill, cached in DynamoDB after first run | [kiss/s3-vs-athena.md](./kiss/s3-vs-athena.md) |
 | 3 | **Store confusion matrix in model or metrics dict?** | New field on `SectionEvaluationResult` vs embed in existing `metrics` dict | Metrics dict — one line change, no model changes, follows existing pattern | [kiss/confusion-matrix-storage.md](./kiss/confusion-matrix-storage.md) |
+| 4 | **Aggregation data source & engine?** | S3 JSON + custom, Stickler native, Athena SQL, or consolidated parquet | S3 JSON + custom aggregator — simplest, works today, cached in DynamoDB. Parquet path for notebooks later. | [kiss/aggregation-data-source.md](./kiss/aggregation-data-source.md) |
 
 ---
 
@@ -24,6 +25,7 @@ Review these decisions before building. Each links to a detailed analysis with p
 | [Schema & API](./schema-and-api.md) | GraphQL schema changes, `fieldLevelMetrics` JSON shape, resolver changes, query updates |
 | [UI Changes](./ui-changes.md) | Test Studio wireframes, field-level metrics table, color coding, component structure |
 | [Testing & Verification](./testing.md) | 3-layer test plan: unit tests, notebook verification, integration test — with code samples and reviewer checklist |
+| [Future: Stickler Refactor](./future-stickler-refactor.md) | Migration path: `aggregate_from_comparisons()`, optional `stickler-eval[storage]`, swap timeline |
 
 ---
 
@@ -63,9 +65,10 @@ accelerated-intelligent-document-processing-on-aws/
 ├── nested/appsync/
 │   └── src/
 │       ├── api/schema.graphql                       # Add fieldLevelMetrics to TestRun
-│       └── lambda/test_results_resolver/index.py    # Call bulk aggregator
+│       └── lambda/test_results_resolver/
+│           ├── index.py                             # Call bulk aggregator
+│           └── bulk_aggregator.py                   # NEW — standalone copy of aggregator (no deps)
 ├── src/
-│   ├── lambda/save_reporting_data/ (or reporting)   # Store confusion_matrix in parquet
 │   └── ui/src/components/test-studio/
 │       └── TestResults.jsx                          # Field-level metrics UI
 ├── notebooks/examples/
@@ -73,6 +76,8 @@ accelerated-intelligent-document-processing-on-aws/
 └── lib/idp_common_pkg/tests/unit/evaluation/
     └── test_bulk_aggregator.py                      # NEW — unit tests
 ```
+
+> **Note:** `bulk_aggregator.py` exists in two places — the Lambda directory (standalone, zero deps) and `idp_common/evaluation/bulk/aggregator.py` (for notebooks/CLI). Both are identical ~80-line files. This avoids adding Lambda layers. See [kiss/stickler-import.md](./kiss/stickler-import.md) for rationale.
 
 ---
 
@@ -106,15 +111,9 @@ In `_transform_stickler_result()`, ensure the `confusion_matrix` key from the St
 "confusion_matrix": stickler_result.get("confusion_matrix", {}),
 ```
 
-#### 1c. Add confusion_matrix to reporting parquet schema
+#### 1c. ~~Add confusion_matrix to reporting parquet schema~~ (Deferred)
 
-File: `lib/idp_common_pkg/idp_common/reporting/save_reporting_data.py`
-
-Add a `confusion_matrix_json` string column to the `document_evaluations` parquet schema that stores the serialized confusion matrix per document. This enables re-aggregation from Athena if needed.
-
-```python
-("confusion_matrix_json", pa.string()),  # JSON-serialized confusion matrix
-```
+> **Moved to future work.** The initial implementation reads confusion matrices from S3 eval JSONs directly (KISS decision #4). Adding a `confusion_matrix_json` column to the reporting parquet is a future enhancement for notebook-based analysis. See [future-stickler-refactor.md](./future-stickler-refactor.md).
 
 ---
 
@@ -247,49 +246,61 @@ from idp_common.evaluation.bulk import BulkEvaluationAggregator
 ### Phase 3: Integrate aggregator into test_results_resolver Lambda
 
 File: `nested/appsync/src/lambda/test_results_resolver/index.py`
+File: `nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py` ← **NEW** (standalone copy)
 
 The current `_aggregate_test_run_metrics()` function queries Athena for AVG metrics. We need to add a parallel path that:
 
-1. Queries the per-document `confusion_matrix_json` from Athena
-2. Feeds each into `BulkEvaluationAggregator.update()`
-3. Calls `compute()` to get field-level metrics
-4. Returns these alongside the existing metrics
+1. Queries Athena for document IDs in the test run
+2. Reads each eval JSON from S3
+3. Feeds confusion matrices into `BulkEvaluationAggregator.update()`
+4. Calls `compute()` to get field-level metrics
+5. Returns these alongside the existing metrics
 
-#### 3a. Add field-level metrics query
+#### 3a. Copy `bulk_aggregator.py` into Lambda directory
+
+Copy `idp_common/evaluation/bulk/aggregator.py` → `test_results_resolver/bulk_aggregator.py`. This is a standalone ~80-line file with zero imports beyond `collections.defaultdict` and `typing`. No Lambda layers needed.
 
 ```python
-def _get_field_level_metrics_from_athena(test_run_id):
-    """Get per-document confusion matrices and aggregate via BulkEvaluationAggregator."""
-    database = os.environ.get('ATHENA_DATABASE')
-    if not database:
+# In index.py
+from bulk_aggregator import BulkEvaluationAggregator
+```
+
+#### 3b. Add field-level metrics retrieval
+
+#### 3b. Add field-level metrics retrieval
+
+```python
+def _get_field_level_metrics(test_run_id):
+    """Read per-document eval JSONs from S3, extract confusion matrices, aggregate."""
+    output_bucket = os.environ.get('OUTPUT_BUCKET')
+    if not output_bucket:
         return {}
 
-    query = f"""
-    SELECT document_id, confusion_matrix_json
-    FROM "{database}"."document_evaluations"
-    WHERE document_id LIKE '{test_run_id}%'
-      AND confusion_matrix_json IS NOT NULL
-    """
-    results = _execute_athena_query(query, database)
-
-    if not results:
+    # 1. Get document keys from Athena (reuse existing query pattern)
+    doc_keys = _get_document_keys_for_test_run(test_run_id)
+    if not doc_keys:
         return {}
 
-    from idp_common.evaluation.bulk import BulkEvaluationAggregator
-    import json
-
+    # 2. Read eval JSONs from S3, feed confusion matrices into aggregator
+    from bulk_aggregator import BulkEvaluationAggregator
     aggregator = BulkEvaluationAggregator()
-    for row in results:
+
+    for doc_key in doc_keys:
         try:
-            cm = json.loads(row['confusion_matrix_json'])
-            aggregator.update(cm, doc_id=row.get('document_id'))
-        except (json.JSONDecodeError, TypeError):
+            eval_key = f"{doc_key}/evaluation/results.json"
+            response = s3_client.get_object(Bucket=output_bucket, Key=eval_key)
+            eval_result = json.loads(response['Body'].read())
+            for section in eval_result.get('section_results', []):
+                cm = section.get('metrics', {}).get('confusion_matrix', {})
+                if cm:
+                    aggregator.update(cm, doc_id=doc_key)
+        except Exception:
             continue
 
     return aggregator.compute()
 ```
 
-#### 3b. Wire into `_aggregate_test_run_metrics`
+#### 3c. Wire into `_aggregate_test_run_metrics`
 
 Add `field_level_metrics` to the returned dict:
 
@@ -297,15 +308,15 @@ Add `field_level_metrics` to the returned dict:
 def _aggregate_test_run_metrics(test_run_id):
     evaluation_metrics = _get_evaluation_metrics_from_athena(test_run_id)
     cost_data = _get_cost_data_from_athena(test_run_id)
-    field_level_metrics = _get_field_level_metrics_from_athena(test_run_id)
+    field_level_metrics = _get_field_level_metrics(test_run_id)  # ← NEW
 
     return {
         # ... existing keys ...
-        'field_level_metrics': field_level_metrics,
+        'field_level_metrics': field_level_metrics,                # ← NEW
     }
 ```
 
-#### 3c. Include in cached and returned results
+#### 3d. Include in cached and returned results
 
 Update `get_test_results()` and `handle_cache_update_request()` to include `fieldLevelMetrics` in the response and cache.
 
@@ -409,6 +420,7 @@ See the [kiss/](./kiss/) directory for detailed analysis of each simplification 
 - [kiss/stickler-import.md](./kiss/stickler-import.md) — Import Stickler directly vs custom aggregator
 - [kiss/s3-vs-athena.md](./kiss/s3-vs-athena.md) — S3 direct reads vs Athena column for confusion matrix retrieval
 - [kiss/confusion-matrix-storage.md](./kiss/confusion-matrix-storage.md) — Model field vs metrics dict for confusion matrix persistence
+- [kiss/aggregation-data-source.md](./kiss/aggregation-data-source.md) — Data source and aggregation engine selection
 
 ---
 

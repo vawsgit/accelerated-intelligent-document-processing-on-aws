@@ -115,6 +115,8 @@ graph TD
 | Decision | Rationale |
 |----------|-----------|
 | No Stickler import | Avoids adding stickler as Lambda dependency; operates on plain dicts |
+| Standalone `.py` file in Lambda dir | Lambda stays layer-free; easier to manage than Lambda layers ([KISS #1](./kiss/stickler-import.md)) |
+| Two copies of the file | Lambda dir + `idp_common` — sync risk is low (textbook math), eliminated when Stickler refactor ships |
 | Micro-averaging | Each field instance counts equally — standard for NER/extraction tasks |
 | Dot-path flattening | Enables flat table display in UI while preserving hierarchy info |
 | `errors` list | Captures malformed confusion matrices without failing the whole aggregation |

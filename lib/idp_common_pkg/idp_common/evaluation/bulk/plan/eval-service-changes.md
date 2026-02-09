@@ -79,4 +79,4 @@ The confusion matrix in `metrics` will be serialized to JSON and saved to S3 aut
 - `_transform_stickler_result()` logic for TP/FP/FN/TN counting — that stays as-is for per-document metrics
 - `SectionEvaluationResult` dataclass (if using Option B)
 - `AttributeEvaluationResult` — no changes
-- Reporting pipeline parquet schema (KISS approach — skip Athena column)
+- Reporting pipeline parquet schema — deferred to future work (see [future-stickler-refactor.md](./future-stickler-refactor.md))
