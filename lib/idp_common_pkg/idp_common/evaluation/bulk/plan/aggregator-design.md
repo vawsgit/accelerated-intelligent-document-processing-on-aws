@@ -1,8 +1,35 @@
-# Aggregator Class: Design & API
+# Aggregator Design
 
-## Class: `BulkEvaluationAggregator`
+> **🔄 Updated 2026-02-12:** [Stickler PR #74](https://github.com/awslabs/stickler/pull/74) shipped `aggregate_from_comparisons()` and `update_from_comparison_result()`. The custom `BulkEvaluationAggregator` class described below is now only needed as a standalone zero-dep shim in the `test_results_resolver` Lambda. For `idp_common` (notebooks, CLI, Docker Lambdas), use `from stickler import aggregate_from_comparisons` directly.
 
-Location: `lib/idp_common_pkg/idp_common/evaluation/bulk/aggregator.py`
+## Two-Tier Approach
+
+| Context | Aggregation Engine | Location |
+|---------|-------------------|----------|
+| `idp_common` (notebooks, CLI, Docker Lambdas) | `stickler.aggregate_from_comparisons()` | Stickler package (already a dependency) |
+| `test_results_resolver` Lambda (bare Zip) | `BulkEvaluationAggregator` standalone shim | `test_results_resolver/bulk_aggregator.py` |
+
+## Stickler-Native API (`idp_common` contexts)
+
+```python
+from stickler import aggregate_from_comparisons
+
+# Takes list of compare_with() result dicts, returns ProcessEvaluation
+result = aggregate_from_comparisons(comparison_results)
+
+# Access metrics
+result.document_count    # int
+result.metrics           # dict: overall P/R/F1/Accuracy + raw counts
+result.field_metrics     # dict: per-field P/R/F1/Accuracy + raw counts
+result.errors            # list: error records
+result.pretty_print_metrics()  # formatted console output
+```
+
+## Lambda Shim: `BulkEvaluationAggregator`
+
+Location: `nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py`
+
+This is a standalone ~80-line file with zero imports beyond `collections.defaultdict` and `typing`. It replicates Stickler's accumulation logic for use in the bare Zip Lambda.
 
 ## Public API
 
@@ -114,9 +141,10 @@ graph TD
 
 | Decision | Rationale |
 |----------|-----------|
-| No Stickler import | Avoids adding stickler as Lambda dependency; operates on plain dicts |
-| Standalone `.py` file in Lambda dir | Lambda stays layer-free; easier to manage than Lambda layers ([KISS #1](./kiss/stickler-import.md)) |
-| Two copies of the file | Lambda dir + `idp_common` — sync risk is low (textbook math), eliminated when Stickler refactor ships |
+| Stickler-native for `idp_common` | PR #74 resolved the API mismatch; no reason to maintain custom code where Stickler is available |
+| Standalone shim for Lambda only | Lambda is bare Zip with no deps; Stickler + transitive deps = 221 MB |
+| Single copy of shim (Lambda dir only) | No sync risk — `idp_common` uses Stickler directly |
+| Parity test required | Must verify Lambda shim produces identical output to `aggregate_from_comparisons()` |
 | Micro-averaging | Each field instance counts equally — standard for NER/extraction tasks |
 | Dot-path flattening | Enables flat table display in UI while preserving hierarchy info |
 | `errors` list | Captures malformed confusion matrices without failing the whole aggregation |

@@ -1,43 +1,29 @@
 # Future: Stickler Refactor & Integration
 
-This document captures the planned Stickler changes and the migration path from the custom `BulkEvaluationAggregator` to Stickler-native aggregation.
+> **🔄 Updated 2026-02-12:** [Stickler PR #74](https://github.com/awslabs/stickler/pull/74) merged `aggregate_from_comparisons()`, `update_from_comparison_result()`, and optional `target_schema` into Stickler's `dev` branch. Steps 1 and 2 below are now actionable once a Stickler release ships. See [.working/pr-74-integration/research.md](../.working/pr-74-integration/research.md) for full analysis.
 
 ## Current State
 
-The IDP Accelerator uses a custom `BulkEvaluationAggregator` (~80 lines, pure Python) that replicates Stickler's `_accumulate_confusion_matrix()` logic. This exists because:
+~~The IDP Accelerator uses a custom `BulkEvaluationAggregator` (~80 lines, pure Python) that replicates Stickler's `_accumulate_confusion_matrix()` logic.~~
 
-1. `BulkStructuredModelEvaluator.update()` takes `StructuredModel` instances — API mismatch (we have pre-computed confusion matrix dicts)
-2. Stickler + deps = 221 MB — can't add to the bare Zip Lambda
-3. The accumulation math is ~80 lines of textbook P/R/F1 derivation
+**Updated:** With PR #74 merged, `idp_common` will use `from stickler import aggregate_from_comparisons` directly. The only custom aggregation code is the standalone `bulk_aggregator.py` shim in the `test_results_resolver` Lambda (bare Zip, can't import Stickler's 221 MB deps).
 
-## Stickler Change #1: `aggregate_from_comparisons()`
+## Stickler Change #1: `aggregate_from_comparisons()` — ✅ SHIPPED (PR #74)
 
-**Priority: High** — unblocks native Stickler aggregation in IDP
-
-Add a method that accepts pre-computed `compare_with()` results:
+Shipped as a standalone module-level function:
 
 ```python
-class BulkStructuredModelEvaluator:
-    # Existing
-    def update(self, gt_model: StructuredModel, pred_model: StructuredModel, doc_id=None): ...
+from stickler import aggregate_from_comparisons
 
-    # NEW
-    def aggregate_from_comparisons(self, comparisons: list[dict]) -> ProcessEvaluation:
-        """Aggregate from pre-computed compare_with() results."""
-        for comparison in comparisons:
-            if "confusion_matrix" in comparison:
-                self._accumulate_confusion_matrix(comparison["confusion_matrix"])
-                self._processed_count += 1
-        return self.compute()
+# Takes list of compare_with() result dicts, returns ProcessEvaluation
+result = aggregate_from_comparisons(comparison_results)
 ```
 
-This is a small refactor — it exposes the existing `_accumulate_confusion_matrix()` internal through a public API that accepts dicts instead of StructuredModel instances.
-
-**No new dependencies required.**
+Also shipped: `update_from_comparison_result()` as an instance method on `BulkStructuredModelEvaluator` for incremental accumulation, and `target_schema` is now optional.
 
 ## Stickler Change #2: `stickler-eval[storage]` optional dependency
 
-**Priority: Low** — convenience enhancement, not blocking
+**Priority: Low** — convenience enhancement, not blocking. **Status: Not yet shipped.**
 
 Add optional S3/MinIO support for saving/loading evaluation state as parquet:
 
@@ -45,45 +31,28 @@ Add optional S3/MinIO support for saving/loading evaluation state as parquet:
 # pyproject.toml
 [project.optional-dependencies]
 llm = ["strands-agents>=1.0.0,<=1.16.0"]
-storage = ["boto3>=1.26.0", "pyarrow>=14.0.0"]    # ← NEW
-```
-
-```python
-# Usage
-evaluator = BulkStructuredModelEvaluator(target_schema=InvoiceModel)
-evaluator.save_results("s3://bucket/test-run-123/bulk_eval.parquet")
-evaluator.save_results("file:///tmp/bulk_eval.parquet")
-# MinIO
-evaluator.save_results("s3://bucket/eval.parquet", endpoint_url="http://localhost:9000")
-```
-
-Follows the existing pattern from `comparators/llm.py`:
-```python
-try:
-    import boto3
-    BOTO3_AVAILABLE = True
-except ImportError:
-    BOTO3_AVAILABLE = False
+storage = ["boto3>=1.26.0", "pyarrow>=14.0.0"]    # ← NOT YET SHIPPED
 ```
 
 ## Migration Path for IDP Accelerator
 
-### Step 1 (current PR): Custom aggregator
-- `BulkEvaluationAggregator` in `idp_common/evaluation/bulk/aggregator.py`
-- Copy as `test_results_resolver/bulk_aggregator.py` for Lambda use
-- No Stickler dependency in the aggregation path
+### Step 1 (current): Standalone Lambda shim + Stickler for idp_common
+- `test_results_resolver/bulk_aggregator.py` — standalone zero-dep shim for Lambda
+- `idp_common/evaluation/bulk/__init__.py` — re-exports `aggregate_from_comparisons` from Stickler
+- Notebooks and CLI use Stickler directly
 
-### Step 2 (after Stickler ships `aggregate_from_comparisons`):
-- Replace `BulkEvaluationAggregator` in `idp_common` with:
-  ```python
-  from stickler.structured_object_evaluator.bulk_structured_model_evaluator import BulkStructuredModelEvaluator
-  evaluator = BulkStructuredModelEvaluator(target_schema=None)
-  evaluator.aggregate_from_comparisons(confusion_matrices)
-  ```
-- Lambda copy (`bulk_aggregator.py`) stays as custom code (no Stickler in Lambda)
-- Or: if Stickler deps shrink, add evaluation layer to Lambda
+### ~~Step 2 (after Stickler ships `aggregate_from_comparisons`):~~ → NOW ACTIONABLE
+- ~~Replace `BulkEvaluationAggregator` in `idp_common`~~ → Done by design (no custom class in `idp_common`)
+- Bump `stickler-eval` version in `pyproject.toml` to the release containing PR #74
+- Lambda shim stays as custom code (packaging constraint unchanged)
+
+**Blocking:** Awaiting a tagged Stickler release that includes PR #74. Currently on `dev` only.
 
 ### Step 3 (after `stickler-eval[storage]` ships):
 - Notebooks use Stickler's native parquet save/load
 - Reporting pipeline optionally writes consolidated parquet
 - Lambda path unchanged (still reads S3 eval JSONs, cached in DynamoDB)
+
+### Step 4 (long-term): Eliminate Lambda shim
+- If Stickler extracts accumulation logic into a zero-dep subpackage (e.g., `stickler-eval[core]` without scipy/pandas), the Lambda shim can be replaced with a direct import
+- Or: if the Lambda is converted to Docker image for other reasons, Stickler can be imported directly

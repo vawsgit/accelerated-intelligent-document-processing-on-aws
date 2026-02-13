@@ -298,20 +298,27 @@ The Stickler import approach would be better if:
 - We needed to **re-evaluate** documents with different thresholds/comparators at query time
 - We needed Stickler's `merge_state()` for distributed evaluation across multiple Lambdas
 - The test_results_resolver was **already** a Docker image with heavy dependencies
-- Stickler offered a `update_from_confusion_matrix(cm_dict)` public method (it doesn't today)
-
-If Stickler adds a public API for accumulating pre-computed confusion matrices in a future version, we should revisit this decision.
+- ~~Stickler offered a `update_from_confusion_matrix(cm_dict)` public method (it doesn't today)~~ → **Now it does — see addendum below**
 
 ---
 
-## Future: Post-Refactor Migration Path
+## 🔄 Addendum (2026-02-12): Stickler PR #74 Resolves the API Mismatch
 
-When Stickler ships `aggregate_from_comparisons(comparisons: list[dict])`, the migration is:
+[Stickler PR #74](https://github.com/awslabs/stickler/pull/74) merged to `dev` on 2026-02-12, shipping:
 
-1. **`idp_common` aggregator** — replace custom `BulkEvaluationAggregator` with a thin wrapper around Stickler's method. The `EvaluationFunction` Lambda (Docker image) already has Stickler installed.
+- `update_from_comparison_result(comparison_result, doc_id)` — instance method accepting pre-computed `compare_with()` result dicts
+- `aggregate_from_comparisons(comparison_results)` — standalone function, top-level import: `from stickler import aggregate_from_comparisons`
+- `target_schema` is now optional — enables schema-less aggregation
 
-2. **`test_results_resolver` Lambda** — keep the standalone `bulk_aggregator.py` copy. This Lambda is a bare Zip with no layers. Adding Stickler (221 MB) is not viable unless the dependency chain shrinks significantly.
+**This resolves the fundamental API mismatch** that was the primary reason for the custom aggregator recommendation. The updated decision is:
 
-3. **Long-term** — if Stickler extracts the accumulation logic into a zero-dep subpackage (e.g., `stickler-eval[core]` without scipy/pandas), the Lambda copy can be replaced with a direct import.
+| Context | Approach |
+|---------|----------|
+| `idp_common` (notebooks, CLI, Docker Lambdas) | **Use Stickler directly:** `from stickler import aggregate_from_comparisons` |
+| `test_results_resolver` Lambda (bare Zip) | **Keep standalone shim** — packaging constraint (221 MB) unchanged |
 
-See [future-stickler-refactor.md](../future-stickler-refactor.md) for full details.
+The custom `BulkEvaluationAggregator` class is no longer needed in `idp_common`. It only exists as a Lambda-only shim in `test_results_resolver/bulk_aggregator.py`.
+
+**Blocking:** PR #74 is on Stickler's `dev` branch, not released. IDP pins `stickler-eval==0.1.4`. Implementation blocked until a Stickler release includes these changes.
+
+See [.working/pr-74-integration/research.md](../.working/pr-74-integration/research.md) for full analysis and [future-stickler-refactor.md](../future-stickler-refactor.md) for updated migration path.

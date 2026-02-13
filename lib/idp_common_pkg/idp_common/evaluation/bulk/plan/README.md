@@ -2,16 +2,18 @@
 
 📌 **Original Issue**: [#179 — Bulk Evaluation Aggregation](https://github.com/aws-solutions-library-samples/accelerated-intelligent-document-processing-on-aws/issues/179)
 
+> **🔄 Updated 2026-02-12:** [Stickler PR #74](https://github.com/awslabs/stickler/pull/74) merged `aggregate_from_comparisons()` and `update_from_comparison_result()` into Stickler's `dev` branch. This resolves the API mismatch that drove KISS Decision #1. See [.working/pr-74-integration/research.md](./.working/pr-74-integration/research.md) for full analysis. Plan updated below to reflect two-tier approach: Stickler-native for `idp_common`, standalone shim for Lambda only.
+
 ## ⚠️ KISS Decisions Required Before Implementation
 
 Review these decisions before building. Each links to a detailed analysis with pros/cons:
 
 | # | Decision | Options | Recommended | Doc |
 |---|----------|---------|-------------|-----|
-| 1 | **Import Stickler directly or reimplement accumulation?** | Import `BulkStructuredModelEvaluator` vs custom `BulkEvaluationAggregator` | Custom aggregator (~80 lines) — Stickler's API takes StructuredModel instances (mismatch), adds 221 MB deps. Swap to Stickler native after refactor ships. | [kiss/stickler-import.md](./kiss/stickler-import.md) |
+| 1 | **Import Stickler directly or reimplement accumulation?** | Import `aggregate_from_comparisons()` vs custom `BulkEvaluationAggregator` | **Two-tier** — Use Stickler's `aggregate_from_comparisons()` in `idp_common` (notebooks, CLI, Docker Lambdas). Keep standalone ~80-line shim in `test_results_resolver` Lambda only (bare Zip, can't import Stickler's 221 MB deps). | [kiss/stickler-import.md](./kiss/stickler-import.md) |
 | 2 | **Retrieve confusion matrices from Athena or S3?** | Add Athena parquet column vs read eval JSONs from S3 | S3 direct — no schema migration, no backfill, cached in DynamoDB after first run | [kiss/s3-vs-athena.md](./kiss/s3-vs-athena.md) |
 | 3 | **Store confusion matrix in model or metrics dict?** | New field on `SectionEvaluationResult` vs embed in existing `metrics` dict | Metrics dict — one line change, no model changes, follows existing pattern | [kiss/confusion-matrix-storage.md](./kiss/confusion-matrix-storage.md) |
-| 4 | **Aggregation data source & engine?** | S3 JSON + custom, Stickler native, Athena SQL, or consolidated parquet | S3 JSON + custom aggregator — simplest, works today, cached in DynamoDB. Parquet path for notebooks later. | [kiss/aggregation-data-source.md](./kiss/aggregation-data-source.md) |
+| 4 | **Aggregation data source & engine?** | S3 JSON + custom, Stickler native, Athena SQL, or consolidated parquet | S3 JSON + Stickler `aggregate_from_comparisons()` for `idp_common`; S3 JSON + standalone shim for Lambda. Cached in DynamoDB. | [kiss/aggregation-data-source.md](./kiss/aggregation-data-source.md) |
 
 ---
 
@@ -20,7 +22,7 @@ Review these decisions before building. Each links to a detailed analysis with p
 | Document | Description |
 |----------|-------------|
 | [Data Flow](./data-flow.md) | End-to-end data flow with Mermaid diagrams, current vs proposed state, confusion matrix structure |
-| [Aggregator Design](./aggregator-design.md) | `BulkEvaluationAggregator` class API, input/output shapes, field path resolution, design decisions |
+| [Aggregator Design](./aggregator-design.md) | Two-tier approach: Stickler-native for `idp_common`, standalone shim API for Lambda, input/output shapes, field path resolution |
 | [Eval Service Changes](./eval-service-changes.md) | Changes to `evaluate_section()` and `_transform_stickler_result()` with before/after code |
 | [Schema & API](./schema-and-api.md) | GraphQL schema changes, `fieldLevelMetrics` JSON shape, resolver changes, query updates |
 | [UI Changes](./ui-changes.md) | Test Studio wireframes, field-level metrics table, color coding, component structure |
@@ -35,12 +37,13 @@ Integrate Stickler's `BulkStructuredModelEvaluator` aggregation logic into the I
 
 ### What will be done
 
-- Add a `BulkEvaluationAggregator` class in a new `idp_common.evaluation.bulk` subpackage that replicates Stickler's `BulkStructuredModelEvaluator` accumulation logic (without importing stickler directly, to avoid Lambda dependency issues)
-- Modify the `test_results_resolver` Lambda to call the new aggregator instead of (or in addition to) the current Athena AVG queries
+- Use Stickler's new `aggregate_from_comparisons()` function ([PR #74](https://github.com/awslabs/stickler/pull/74)) in `idp_common` for notebooks, CLI, and Docker Lambda contexts
+- Maintain a standalone zero-dep `bulk_aggregator.py` shim in the `test_results_resolver` Lambda (bare Zip Lambda, can't import Stickler's 221 MB deps)
+- Modify the `test_results_resolver` Lambda to call the aggregator instead of (or in addition to) the current Athena AVG queries
 - Extend the GraphQL `TestRun` type with a `fieldLevelMetrics` field
 - Update the Test Studio `TestResults.jsx` UI to display field-level metrics (P/R/F1 per field, sorted by worst-performing)
 - Store per-document confusion matrix data in the reporting pipeline so it can be re-aggregated
-- Create/update a notebook demonstrating bulk evaluation
+- Create/update a notebook demonstrating bulk evaluation using Stickler's native API
 
 ### What will NOT be done
 
@@ -56,28 +59,28 @@ accelerated-intelligent-document-processing-on-aws/
 ├── lib/idp_common_pkg/
 │   └── idp_common/
 │       └── evaluation/
-│           ├── __init__.py                          # Export new aggregator
+│           ├── __init__.py                          # Re-export aggregate_from_comparisons from Stickler
 │           ├── bulk/                                # NEW — dedicated subpackage
-│           │   ├── __init__.py                      # Package init + exports
-│           │   ├── README.md                        # Feature docs (create first)
-│           │   └── aggregator.py                    # BulkEvaluationAggregator class
+│           │   ├── __init__.py                      # Package init + re-exports from Stickler
+│           │   └── README.md                        # Feature docs (create first)
 │           └── service.py                           # Add confusion_matrix to eval output
 ├── nested/appsync/
 │   └── src/
 │       ├── api/schema.graphql                       # Add fieldLevelMetrics to TestRun
 │       └── lambda/test_results_resolver/
 │           ├── index.py                             # Call bulk aggregator
-│           └── bulk_aggregator.py                   # NEW — standalone copy of aggregator (no deps)
+│           └── bulk_aggregator.py                   # NEW — standalone zero-dep shim (~80 lines)
 ├── src/
 │   └── ui/src/components/test-studio/
 │       └── TestResults.jsx                          # Field-level metrics UI
 ├── notebooks/examples/
-│   └── step7_bulk_evaluation.ipynb                  # NEW — demo notebook
-└── lib/idp_common_pkg/tests/unit/evaluation/
-    └── test_bulk_aggregator.py                      # NEW — unit tests
+│   └── step7_bulk_evaluation.ipynb                  # NEW — demo notebook (uses Stickler directly)
+├── lib/idp_common_pkg/tests/unit/evaluation/
+│   └── test_bulk_aggregator.py                      # NEW — unit tests + parity test vs Stickler
+└── pyproject.toml                                   # Bump stickler-eval version when released
 ```
 
-> **Note:** `bulk_aggregator.py` exists in two places — the Lambda directory (standalone, zero deps) and `idp_common/evaluation/bulk/aggregator.py` (for notebooks/CLI). Both are identical ~80-line files. This avoids adding Lambda layers. See [kiss/stickler-import.md](./kiss/stickler-import.md) for rationale.
+> **Note:** The standalone `bulk_aggregator.py` exists only in the Lambda directory. Unlike the original plan, `idp_common` no longer needs its own copy — it uses `from stickler import aggregate_from_comparisons` directly. The Lambda shim is the only custom aggregation code. See [kiss/stickler-import.md](./kiss/stickler-import.md) for rationale.
 
 ---
 
@@ -117,119 +120,24 @@ In `_transform_stickler_result()`, ensure the `confusion_matrix` key from the St
 
 ---
 
-### Phase 2: Create `BulkEvaluationAggregator` in `evaluation/bulk/` subpackage
+### Phase 2: Wire Stickler's `aggregate_from_comparisons()` into `evaluation/bulk/` subpackage
 
-This is the core aggregation class. It replicates the accumulation logic from `BulkStructuredModelEvaluator` but operates on pre-computed confusion matrix dicts (not StructuredModel instances), since the per-document evaluation has already happened.
+> **Updated 2026-02-12:** [Stickler PR #74](https://github.com/awslabs/stickler/pull/74) shipped `aggregate_from_comparisons()` and `update_from_comparison_result()`. The custom `BulkEvaluationAggregator` class is no longer needed in `idp_common`. This phase now creates a thin re-export subpackage instead of reimplementing accumulation logic.
 
-The new subpackage lives at `idp_common/evaluation/bulk/`, following the project's pattern of organizing sub-features into subfolders (like `agents/analytics/`, `agents/testing/`). This gives the feature a dedicated home for its README, aggregator, models, and any future additions.
+The new subpackage lives at `idp_common/evaluation/bulk/`, following the project's pattern of organizing sub-features into subfolders (like `agents/analytics/`, `agents/testing/`). This gives the feature a dedicated home for its README and any future additions.
 
 File: `lib/idp_common_pkg/idp_common/evaluation/bulk/__init__.py`
 
 ```python
-"""Bulk evaluation aggregation for multi-document metrics."""
+"""Bulk evaluation aggregation for multi-document metrics.
 
-from idp_common.evaluation.bulk.aggregator import BulkEvaluationAggregator
-
-__all__ = ["BulkEvaluationAggregator"]
-```
-
-File: `lib/idp_common_pkg/idp_common/evaluation/bulk/aggregator.py`
-
-```python
-"""
-Bulk evaluation aggregator for multi-document metrics.
-
-Accumulates per-document confusion matrix results into aggregate
-field-level and overall metrics. Replicates the accumulation logic
-from stickler's BulkStructuredModelEvaluator without requiring
-stickler as a runtime dependency.
+Uses Stickler's aggregate_from_comparisons() to accumulate pre-computed
+compare_with() results into field-level P/R/F1/Accuracy metrics.
 """
 
-from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from stickler import aggregate_from_comparisons
 
-
-class BulkEvaluationAggregator:
-    """
-    Accumulates confusion matrix results across documents to produce
-    aggregate field-level and overall P/R/F1/Accuracy metrics.
-    """
-
-    METRIC_KEYS = ("tp", "fp", "tn", "fn", "fd", "fa")
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self._overall = defaultdict(int)
-        self._fields = defaultdict(lambda: defaultdict(int))
-        self._doc_count = 0
-        self._errors = []
-
-    def update(self, confusion_matrix: Dict[str, Any], doc_id: Optional[str] = None):
-        """Accumulate one document's confusion matrix."""
-        if not confusion_matrix:
-            return
-        self._doc_count += 1
-
-        # Overall
-        if "overall" in confusion_matrix:
-            for k, v in confusion_matrix["overall"].items():
-                if k in self.METRIC_KEYS and isinstance(v, (int, float)):
-                    self._overall[k] += v
-
-        # Fields (recursive)
-        if "fields" in confusion_matrix:
-            self._accumulate_fields(confusion_matrix["fields"], "")
-
-    def _accumulate_fields(self, fields: Dict, prefix: str):
-        """Recursively accumulate field metrics with dotted paths."""
-        for name, data in fields.items():
-            path = f"{prefix}.{name}" if prefix else name
-            if not isinstance(data, dict):
-                continue
-
-            # Direct metrics
-            for k in self.METRIC_KEYS:
-                if k in data and isinstance(data[k], (int, float)):
-                    self._fields[path][k] += data[k]
-
-            # Hierarchical: overall + fields
-            if "overall" in data:
-                for k, v in data["overall"].items():
-                    if k in self.METRIC_KEYS and isinstance(v, (int, float)):
-                        self._fields[path][k] += v
-            if "fields" in data and isinstance(data["fields"], dict):
-                self._accumulate_fields(data["fields"], path)
-
-            # List fields with nested_fields
-            if "nested_fields" in data:
-                for nf_name, nf_data in data["nested_fields"].items():
-                    nf_path = f"{path}.{nf_name}"
-                    for k, v in nf_data.items():
-                        if k in self.METRIC_KEYS and isinstance(v, (int, float)):
-                            self._fields[nf_path][k] += v
-
-    def compute(self) -> Dict[str, Any]:
-        """Return aggregated metrics."""
-        return {
-            "document_count": self._doc_count,
-            "overall": self._derive(dict(self._overall)),
-            "fields": {
-                path: self._derive(dict(counts))
-                for path, counts in sorted(self._fields.items())
-            },
-            "errors": self._errors,
-        }
-
-    @staticmethod
-    def _derive(cm: Dict[str, int]) -> Dict[str, Any]:
-        tp, fp, fn, tn = cm.get("tp", 0), cm.get("fp", 0), cm.get("fn", 0), cm.get("tn", 0)
-        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-        acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
-        return {**cm, "precision": p, "recall": r, "f1": f1, "accuracy": acc}
+__all__ = ["aggregate_from_comparisons"]
 ```
 
 #### 2b. Export from `evaluation/__init__.py`
@@ -237,28 +145,47 @@ class BulkEvaluationAggregator:
 File: `lib/idp_common_pkg/idp_common/evaluation/__init__.py`
 
 ```python
-# Bulk aggregation
-from idp_common.evaluation.bulk import BulkEvaluationAggregator
+# Bulk aggregation (Stickler-native)
+from idp_common.evaluation.bulk import aggregate_from_comparisons
 ```
+
+#### 2c. Bump `stickler-eval` version
+
+File: `pyproject.toml`
+
+Update the `stickler-eval` pin to the release containing PR #74 (version TBD — PR merged to `dev`, awaiting release):
+
+```toml
+# When released:
+"stickler-eval>=0.2.0"  # or whatever version ships PR #74
+```
+
+> **⚠️ Blocking:** PR #74 merged to Stickler's `dev` branch, not `main`. The IDP Accelerator currently pins `stickler-eval==0.1.4`. Implementation of this phase is blocked until a Stickler release includes these changes. Track via Stickler releases.
 
 ---
 
 ### Phase 3: Integrate aggregator into test_results_resolver Lambda
 
 File: `nested/appsync/src/lambda/test_results_resolver/index.py`
-File: `nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py` ← **NEW** (standalone copy)
+File: `nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py` ← **NEW** (standalone zero-dep shim)
 
 The current `_aggregate_test_run_metrics()` function queries Athena for AVG metrics. We need to add a parallel path that:
 
 1. Queries Athena for document IDs in the test run
 2. Reads each eval JSON from S3
-3. Feeds confusion matrices into `BulkEvaluationAggregator.update()`
-4. Calls `compute()` to get field-level metrics
-5. Returns these alongside the existing metrics
+3. Feeds confusion matrices into the aggregator
+4. Returns field-level metrics alongside the existing metrics
 
-#### 3a. Copy `bulk_aggregator.py` into Lambda directory
+#### 3a. Create standalone `bulk_aggregator.py` in Lambda directory
 
-Copy `idp_common/evaluation/bulk/aggregator.py` → `test_results_resolver/bulk_aggregator.py`. This is a standalone ~80-line file with zero imports beyond `collections.defaultdict` and `typing`. No Lambda layers needed.
+This is a zero-dep reimplementation of Stickler's accumulation logic (~80 lines). It exists because the `test_results_resolver` is a bare Zip Lambda with no access to Stickler's 221 MB dependency chain.
+
+The shim should match the behavior of Stickler's `update_from_comparison_result()` — specifically:
+- Validate that input contains a `"confusion_matrix"` key
+- Accumulate TP/FP/FN/TN counts per field using dot-path flattening
+- Derive P/R/F1/Accuracy from accumulated counts
+
+> **Parity requirement:** A test must verify that the Lambda shim produces identical output to `stickler.aggregate_from_comparisons()` for the same input. See [testing.md](./testing.md).
 
 ```python
 # In index.py
@@ -335,7 +262,7 @@ type TestRun @aws_cognito_user_pools @aws_iam {
 }
 ```
 
-This is a JSON blob containing the output of `BulkEvaluationAggregator.compute()` — overall and per-field P/R/F1/Accuracy with raw TP/FP/FN/TN counts.
+This is a JSON blob containing the output of the aggregator — overall and per-field P/R/F1/Accuracy with raw TP/FP/FN/TN counts. In `idp_common` contexts this comes from Stickler's `ProcessEvaluation`; in the Lambda it comes from the standalone shim's `compute()` method.
 
 ---
 
@@ -387,11 +314,19 @@ const GET_TEST_RUN = `
 
 File: `notebooks/examples/step7_bulk_evaluation.ipynb`
 
-Demonstrate:
+Demonstrate using Stickler's native `aggregate_from_comparisons()`:
 1. Loading multiple document evaluation results
-2. Using `BulkEvaluationAggregator` to accumulate
-3. Inspecting field-level metrics
+2. Calling `aggregate_from_comparisons()` to get field-level metrics
+3. Inspecting the `ProcessEvaluation` result
 4. Identifying worst-performing fields
+
+```python
+from stickler import aggregate_from_comparisons
+
+# comparison_results = [list of compare_with() result dicts loaded from S3]
+result = aggregate_from_comparisons(comparison_results)
+result.pretty_print_metrics()
+```
 
 This notebook also serves as the Layer 2 verification artifact — see [testing.md](./testing.md) for the full test plan including synthetic fixtures, hand-verifiable assertions, and the reviewer checklist.
 
@@ -399,7 +334,7 @@ This notebook also serves as the Layer 2 verification artifact — see [testing.
 
 File: `lib/idp_common_pkg/tests/unit/evaluation/test_bulk_aggregator.py`
 
-See [testing.md](./testing.md) for test cases and sample code.
+Tests must include a **parity test** that verifies the Lambda's standalone `bulk_aggregator.py` produces identical output to `stickler.aggregate_from_comparisons()` for the same input. See [testing.md](./testing.md) for test cases and sample code.
 
 #### 6c. Update evaluation README and create bulk README
 
@@ -409,7 +344,7 @@ Add section pointing to the new `bulk/` subpackage for multi-document aggregatio
 
 File: `lib/idp_common_pkg/idp_common/evaluation/bulk/README.md`
 
-Primary documentation for the feature: what it does, how it maps to Stickler's `BulkStructuredModelEvaluator`, usage examples, and the data flow from per-document confusion matrices to aggregated field-level metrics. This file should be created first, before any code, to document intent and design decisions.
+Primary documentation for the feature: what it does, how it uses Stickler's `aggregate_from_comparisons()`, usage examples, and the data flow from per-document confusion matrices to aggregated field-level metrics. This file should be created first, before any code, to document intent and design decisions.
 
 ---
 
@@ -426,10 +361,34 @@ See the [kiss/](./kiss/) directory for detailed analysis of each simplification 
 
 ## Code Samples
 
-### BulkEvaluationAggregator usage pattern (Lambda context)
+### Aggregation usage pattern — `idp_common` / notebooks (Stickler-native)
 
 ```python
-from idp_common.evaluation.bulk import BulkEvaluationAggregator
+from stickler import aggregate_from_comparisons
+import json
+
+# Load pre-computed compare_with() results (from S3 or local)
+comparison_results = []
+for f in eval_files:
+    with open(f) as fh:
+        result = json.load(fh)
+    # Each result is a compare_with() output dict with "confusion_matrix" key
+    comparison_results.append(result)
+
+# Aggregate — returns ProcessEvaluation
+process_eval = aggregate_from_comparisons(comparison_results)
+
+# Access metrics
+print(f"Documents: {process_eval.document_count}")
+print(f"Overall: {process_eval.metrics}")
+print(f"Fields: {process_eval.field_metrics}")
+process_eval.pretty_print_metrics()
+```
+
+### Aggregation usage pattern — Lambda (standalone shim)
+
+```python
+from bulk_aggregator import BulkEvaluationAggregator
 import json
 
 aggregator = BulkEvaluationAggregator()
@@ -486,24 +445,23 @@ const FieldLevelMetrics = ({ fieldLevelMetrics }) => {
 ### Notebook cell — loading and aggregating
 
 ```python
+from stickler import aggregate_from_comparisons
 import json
-from idp_common.evaluation.bulk import BulkEvaluationAggregator
 
 # Load eval results (from S3 or local)
 eval_files = ["doc1_eval.json", "doc2_eval.json", ...]
 
-aggregator = BulkEvaluationAggregator()
+comparison_results = []
 for f in eval_files:
     with open(f) as fh:
-        result = json.load(fh)
-    aggregator.update(result.get("confusion_matrix", {}), doc_id=f)
+        comparison_results.append(json.load(fh))
 
-metrics = aggregator.compute()
+result = aggregate_from_comparisons(comparison_results)
 
 # Display field-level metrics sorted by F1
 import pandas as pd
 df = pd.DataFrame([
-    {"field": k, **v} for k, v in metrics["fields"].items()
+    {"field": k, **v} for k, v in result.field_metrics.items()
 ]).sort_values("f1")
 df[["field", "precision", "recall", "f1", "tp", "fp", "fn"]]
 ```

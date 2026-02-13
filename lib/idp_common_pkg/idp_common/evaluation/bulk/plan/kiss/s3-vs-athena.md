@@ -26,7 +26,7 @@ The DynamoDB cache means aggregation only runs once per test run, so the S3 read
 1. Phase 1: Ensure `confusion_matrix` is in eval results JSON saved to S3
 2. Skip Phase 1c entirely (no parquet schema change)
 3. Phase 3: Query Athena for `document_id` list, read each eval JSON from S3
-4. Feed confusion matrices into `BulkEvaluationAggregator`
+4. Feed confusion matrices into aggregator (Stickler-native or Lambda shim)
 5. Cache result in DynamoDB — subsequent requests served from cache
 
 ## Future: Option C — Confusion Matrix Parquet Files

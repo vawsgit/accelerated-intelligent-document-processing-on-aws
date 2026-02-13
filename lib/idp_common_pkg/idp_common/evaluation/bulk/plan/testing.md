@@ -8,8 +8,8 @@ This document details how to verify the bulk evaluation feature works end-to-end
 
 | Layer | What | How | Who |
 |-------|------|-----|-----|
-| 1. Unit tests | `BulkEvaluationAggregator` logic | `pytest` — automated | CI |
-| 2. Notebook verification | Aggregator with real confusion matrices | Jupyter notebook — manual | Reviewer |
+| 1. Unit tests | Lambda shim `BulkEvaluationAggregator` logic + parity vs Stickler | `pytest` — automated | CI |
+| 2. Notebook verification | Stickler `aggregate_from_comparisons()` with real confusion matrices | Jupyter notebook — manual | Reviewer |
 | 3. Integration test | Full pipeline: upload → evaluate → aggregate → UI | IDP CLI + Test Studio UI — manual | Reviewer |
 
 ---
@@ -18,7 +18,7 @@ This document details how to verify the bulk evaluation feature works end-to-end
 
 File: `lib/idp_common_pkg/tests/unit/evaluation/test_bulk_aggregator.py`
 
-These run in CI. The reviewer should confirm they pass and cover the cases below.
+These run in CI. Tests cover the Lambda shim's `BulkEvaluationAggregator` and include a parity test against Stickler's `aggregate_from_comparisons()`.
 
 ### Test Cases
 
@@ -32,12 +32,20 @@ These run in CI. The reviewer should confirm they pass and cover the cases below
 | Mixed docs | 5 docs: 3 with confusion_matrix, 1 empty `{}`, 1 `None` | `document_count: 3`, empty/None skipped |
 | Reset | `update()` × 3, `reset()`, `update()` × 1 | Only last doc counted |
 | Zero denominators | All FN, no TP or FP | `precision: 0.0`, `recall: 0.0`, `f1: 0.0` |
+| **Parity vs Stickler** | Same input to both Lambda shim and `aggregate_from_comparisons()` | Identical metric values |
 
 ### Sample Test Code
 
+> **Note:** Tests import from the Lambda shim's `bulk_aggregator` module. The parity test also imports from Stickler.
+
 ```python
 import pytest
-from idp_common.evaluation.bulk import BulkEvaluationAggregator
+import sys
+import os
+
+# Add Lambda shim to path for testing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../../nested/appsync/src/lambda/test_results_resolver'))
+from bulk_aggregator import BulkEvaluationAggregator
 
 
 class TestBulkEvaluationAggregator:
@@ -114,14 +122,34 @@ pytest tests/unit/evaluation/test_bulk_aggregator.py -v
 
 ### Sync Check
 
-The aggregator exists in two places. Verify they're identical:
+> **🔄 Updated 2026-02-12:** With PR #74, the aggregator no longer exists in two places. `idp_common` uses Stickler's `aggregate_from_comparisons()` directly. The standalone shim only exists in the Lambda directory.
 
-```bash
-diff lib/idp_common_pkg/idp_common/evaluation/bulk/aggregator.py \
-     nested/appsync/src/lambda/test_results_resolver/bulk_aggregator.py
+Instead of a file diff, verify **parity** between the Lambda shim and Stickler:
+
+```python
+# In test_bulk_aggregator.py
+def test_lambda_shim_parity_with_stickler():
+    """Verify Lambda shim produces identical output to Stickler's aggregate_from_comparisons()."""
+    from stickler import aggregate_from_comparisons
+    from bulk_aggregator import BulkEvaluationAggregator  # Lambda shim
+
+    # Same input data
+    comparison_results = [...]  # synthetic compare_with() results
+
+    # Stickler path
+    stickler_result = aggregate_from_comparisons(comparison_results)
+
+    # Lambda shim path
+    agg = BulkEvaluationAggregator()
+    for r in comparison_results:
+        agg.update(r.get("confusion_matrix", {}))
+    shim_result = agg.compute()
+
+    # Verify parity
+    assert shim_result["overall"]["tp"] == stickler_result.metrics["tp"]
+    assert shim_result["overall"]["precision"] == pytest.approx(stickler_result.metrics["cm_precision"])
+    # ... etc for all metric keys
 ```
-
-This should produce no output. Add this check to the reviewer checklist.
 
 ---
 
@@ -143,10 +171,10 @@ cd lib/idp_common_pkg && pip install -e ".[evaluation]"
 
 ```python
 import json
-from idp_common.evaluation.bulk import BulkEvaluationAggregator
+from stickler import aggregate_from_comparisons
 import pandas as pd
 
-print("BulkEvaluationAggregator imported successfully ✅")
+print("Stickler aggregate_from_comparisons imported successfully ✅")
 ```
 
 #### Cell 2: Synthetic test data (3 invoice documents)
@@ -199,21 +227,20 @@ print(f"Created {len(synthetic_docs)} synthetic documents")
 #### Cell 3: Run aggregation
 
 ```python
-aggregator = BulkEvaluationAggregator()
-for doc in synthetic_docs:
-    aggregator.update(doc["confusion_matrix"], doc_id=doc["doc_id"])
+# Build list of compare_with() result dicts (each must have "confusion_matrix" key)
+comparison_results = [{"confusion_matrix": doc["confusion_matrix"]} for doc in synthetic_docs]
 
-metrics = aggregator.compute()
-print(f"Documents aggregated: {metrics['document_count']}")
-print(f"Overall: P={metrics['overall']['precision']:.3f} R={metrics['overall']['recall']:.3f} F1={metrics['overall']['f1']:.3f}")
+result = aggregate_from_comparisons(comparison_results)
+print(f"Documents aggregated: {result.document_count}")
+print(f"Overall: P={result.metrics.get('cm_precision', 0):.3f} R={result.metrics.get('cm_recall', 0):.3f} F1={result.metrics.get('cm_f1', 0):.3f}")
 ```
 
 #### Cell 4: Display as table (sorted by worst F1)
 
 ```python
 df = pd.DataFrame([
-    {"field": k, **v} for k, v in metrics["fields"].items()
-]).sort_values("f1")
+    {"field": k, **v} for k, v in result.field_metrics.items()
+]).sort_values("cm_f1")
 
 # Expected results for hand-verification:
 # invoice_number: TP=3, FP=0, FN=0 → P=1.000, R=1.000, F1=1.000
@@ -221,26 +248,26 @@ df = pd.DataFrame([
 # invoice_date:   TP=2, FP=0, FN=1 → P=1.000, R=0.667, F1=0.800
 # vendor_name:    TP=1, FP=2, FN=1 → P=0.333, R=0.500, F1=0.400
 
-display(df[["field", "precision", "recall", "f1", "tp", "fp", "fn"]])
+display(df[["field", "cm_precision", "cm_recall", "cm_f1", "tp", "fp", "fn"]])
 ```
 
 #### Cell 5: Verify against hand-calculated expected values
 
 ```python
 # Automated assertions the reviewer can run
-fields = metrics["fields"]
+fields = result.field_metrics
 
 assert fields["invoice_number"]["tp"] == 3
-assert fields["invoice_number"]["f1"] == 1.0
+assert fields["invoice_number"]["cm_f1"] == 1.0
 
 assert fields["vendor_name"]["tp"] == 1
 assert fields["vendor_name"]["fp"] == 2
 assert fields["vendor_name"]["fn"] == 1
-assert abs(fields["vendor_name"]["precision"] - 1/3) < 0.001
-assert abs(fields["vendor_name"]["f1"] - 0.4) < 0.001
+assert abs(fields["vendor_name"]["cm_precision"] - 1/3) < 0.001
+assert abs(fields["vendor_name"]["cm_f1"] - 0.4) < 0.001
 
 assert fields["invoice_date"]["fn"] == 1
-assert abs(fields["invoice_date"]["recall"] - 2/3) < 0.001
+assert abs(fields["invoice_date"]["cm_recall"] - 2/3) < 0.001
 
 print("All assertions passed ✅")
 ```
@@ -256,7 +283,7 @@ OUTPUT_BUCKET = "..."  # ← from CloudFormation outputs
 TEST_RUN_PREFIX = "..."  # ← from a completed test run
 
 s3 = boto3.client("s3")
-aggregator = BulkEvaluationAggregator()
+comparison_results = []
 
 # List eval result files
 paginator = s3.get_paginator("list_objects_v2")
@@ -269,15 +296,15 @@ for page in paginator.paginate(Bucket=OUTPUT_BUCKET, Prefix=TEST_RUN_PREFIX):
             for section in eval_result.get("section_results", []):
                 cm = section.get("metrics", {}).get("confusion_matrix", {})
                 if cm:
-                    aggregator.update(cm, doc_id=eval_result.get("document_id"))
+                    comparison_results.append({"confusion_matrix": cm})
 
-result = aggregator.compute()
-print(f"Aggregated {result['document_count']} documents from S3")
+result = aggregate_from_comparisons(comparison_results)
+print(f"Aggregated {result.document_count} documents from S3")
 
 df = pd.DataFrame([
-    {"field": k, **v} for k, v in result["fields"].items()
-]).sort_values("f1")
-display(df[["field", "precision", "recall", "f1", "tp", "fp", "fn"]])
+    {"field": k, **v} for k, v in result.field_metrics.items()
+]).sort_values("cm_f1")
+display(df[["field", "cm_precision", "cm_recall", "cm_f1", "tp", "fp", "fn"]])
 ```
 
 ### What the Reviewer Should Verify
@@ -405,7 +432,7 @@ No new test data files need to be created. The synthetic fixtures in the unit te
 
 ```
 □ Unit tests pass: pytest tests/unit/evaluation/test_bulk_aggregator.py -v
-□ Aggregator files are identical: diff aggregator.py bulk_aggregator.py (no output)
+□ Parity test passes: Lambda shim output matches stickler.aggregate_from_comparisons()
 □ Notebook Cell 5 assertions pass (synthetic data)
 □ Notebook Cell 6 loads real S3 data (if stack available)
 □ Eval results JSON contains confusion_matrix in metrics
@@ -414,4 +441,5 @@ No new test data files need to be created. The synthetic fixtures in the unit te
 □ GraphQL response includes non-null fieldLevelMetrics
 □ Existing metrics (overallAccuracy, costBreakdown, etc.) still work
 □ Test runs without baselines gracefully show no field-level metrics
+□ stickler-eval version bumped to release containing PR #74
 ```

@@ -171,10 +171,14 @@ def _aggregate_test_run_metrics(test_run_id):
 def _get_field_level_metrics(test_run_id):
     """
     Load per-document eval JSONs from S3, extract confusion matrices,
-    and aggregate via BulkEvaluationAggregator.
+    and aggregate via standalone BulkEvaluationAggregator shim.
 
     Uses bulk_aggregator.py — a standalone ~80-line file alongside index.py
     with zero deps beyond stdlib. No Lambda layers needed.
+
+    Note: idp_common uses Stickler's aggregate_from_comparisons() directly,
+    but this Lambda is a bare Zip and can't import Stickler's 221 MB deps.
+    A parity test verifies the shim produces identical output.
     """
     from bulk_aggregator import BulkEvaluationAggregator
     # 1. Query Athena for document IDs + eval result S3 keys

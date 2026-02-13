@@ -34,19 +34,20 @@ Stickler (library)                    IDP Accelerator (application)
 │ • StructuredModel       │           │ • compare_with() → JSON → S3 │
 │ • compare_with()        │           │                              │
 │ • BulkEvaluator         │           │ Post-processing (Lambda)     │
-│   • aggregate_from_     │◄──future──│ • Read eval JSONs from S3    │
-│     comparisons()       │           │ • bulk_aggregator.py (copy)  │
-│   • compute()           │           │ • Cache in DynamoDB          │
-│                         │           │ • Serve via GraphQL          │
-│ Optional [storage]      │           │                              │
-│ • save/load parquet     │           │ Notebooks                    │
-│ • file:// and s3://     │           │ • idp_common aggregator      │
-│ • S3 + MinIO compatible │           │ • Analyze field-level metrics│
+│   • aggregate_from_     │           │ • Read eval JSONs from S3    │
+│     comparisons() ✅    │           │ • bulk_aggregator.py (shim)  │
+│   • update_from_        │           │ • Cache in DynamoDB          │
+│     comparison_result()✅│           │ • Serve via GraphQL          │
+│   • compute()           │           │                              │
+│                         │           │ Notebooks / CLI              │
+│ Optional [storage]      │           │ • aggregate_from_comparisons │
+│ • save/load parquet     │           │   (Stickler-native)          │
+│ • file:// and s3://     │           │ • Analyze field-level metrics│
 └─────────────────────────┘           └──────────────────────────────┘
 ```
 
-**Now:** Custom aggregator in both places (Lambda copy + idp_common).
-**After Stickler refactor:** idp_common swaps to Stickler native; Lambda copy stays (no Stickler deps in Lambda).
+**Now:** Stickler-native for `idp_common`; standalone shim for Lambda only.
+~~**After Stickler refactor:** idp_common swaps to Stickler native~~ → Done by design (PR #74).
 
 ## Current State: What Exists Today
 
